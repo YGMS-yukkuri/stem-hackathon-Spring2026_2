@@ -30,3 +30,23 @@ export async function fetchRoute({ fromLat, fromLng, toLat, toLng }) {
   }
   return response.json();
 }
+
+export async function geocodeAddress(query) {
+  const params = new URLSearchParams({ query });
+  const response = await fetch(`/api/geocode?${params.toString()}`);
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "住所の変換に失敗しました。");
+  }
+  return response.json();
+}
+
+export async function reverseGeocode(lat, lng) {
+  const params = new URLSearchParams({ lat: String(lat), lng: String(lng) });
+  const response = await fetch(`/api/reverse-geocode?${params.toString()}`);
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "現在位置の住所化に失敗しました。");
+  }
+  return response.json();
+}

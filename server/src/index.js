@@ -9,8 +9,37 @@ app.use(express.json());
 
 const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const OSRM_ENDPOINT = "https://router.project-osrm.org";
+const NOMINATIM_ENDPOINT = "https://nominatim.openstreetmap.org";
 const SEARCH_CACHE_MS = 60 * 1000;
 const searchCache = new Map();
+const geocodeCache = new Map();
+const ALLOWED_TAG_VALUES = new Set([
+  "cafe",
+  "restaurant",
+  "fast_food",
+  "food_court",
+  "bar",
+  "pub",
+  "ice_cream",
+  "biergarten",
+  "convenience",
+  "bakery",
+  "confectionery",
+  "chocolate",
+  "tea",
+  "coffee",
+  "pharmacy",
+  "chemist",
+  "drugstore",
+  "attraction",
+  "museum",
+  "gallery",
+  "zoo",
+  "aquarium",
+  "theme_park",
+  "viewpoint",
+  "park",
+]);
 
 function toRadians(value) {
   return (value * Math.PI) / 180;
@@ -40,12 +69,46 @@ function inferCategory(tags = {}) {
   return "facility";
 }
 
+function formatAddressFromTags(tags = {}) {
+  if (tags["addr:full"]) {
+    return tags["addr:full"];
+  }
+
+  const parts = [
+    tags["addr:postcode"],
+    tags["addr:state"],
+    tags["addr:city"],
+    tags["addr:suburb"],
+    tags["addr:street"],
+    tags["addr:housenumber"],
+  ].filter(Boolean);
+
+  return parts.join(" ") || "住所情報なし";
+}
+
+function isRelevantFacility(tags = {}) {
+  const values = [tags.amenity, tags.shop, tags.tourism].filter(Boolean);
+  if (values.length === 0) {
+    return false;
+  }
+  return values.some((value) => ALLOWED_TAG_VALUES.has(value));
+}
+
+function categoryToRegex(category) {
+  if (!category || category === "all") {
+    return ".+";
+  }
+
+  if (category === "drugstore") {
+    return "^(pharmacy|chemist|drugstore)$";
+  }
+
+  return `^${category}$`;
+}
+
 function buildOverpassQuery({ lat, lng, radius, keyword, category }) {
   const safeKeyword = (keyword || "").replace(/[\";]/g, "");
-  const hasCategory = category && category !== "all";
-  const categoryPattern = hasCategory
-    ? `[~\"^(amenity|shop|tourism)$\"~\"^${category}$\",i]`
-    : "[~\"^(amenity|shop|tourism)$\"~\".+\",i]";
+  const categoryPattern = `[~\"^(amenity|shop|tourism)$\"~\"${categoryToRegex(category)}\",i]`;
   const keywordPattern = safeKeyword
     ? `[~\"^(name|brand|operator)$\"~\"${safeKeyword}\",i]`
     : "";
@@ -57,7 +120,7 @@ function buildOverpassQuery({ lat, lng, radius, keyword, category }) {
   way(around:${radius},${lat},${lng})${categoryPattern}${keywordPattern};
   relation(around:${radius},${lat},${lng})${categoryPattern}${keywordPattern};
 );
-out center tags 60;
+out center tags;
 `.trim();
 }
 
@@ -68,11 +131,19 @@ function normalizeFacility(element, userLat, userLng) {
     return null;
   }
 
+  const rawName = (element.tags?.name || "").trim();
+  if (!rawName) {
+    return null;
+  }
+  if (!isRelevantFacility(element.tags)) {
+    return null;
+  }
+
   const distanceMeters = haversineMeters(userLat, userLng, lat, lng);
   return {
     id: `${element.type}-${element.id}`,
-    name: element.tags?.name || "名称未設定",
-    address: element.tags?.["addr:full"] || element.tags?.["addr:street"] || "住所情報なし",
+    name: rawName,
+    address: formatAddressFromTags(element.tags),
     lat,
     lng,
     phone: element.tags?.phone || "",
@@ -81,8 +152,30 @@ function normalizeFacility(element, userLat, userLng) {
     category: inferCategory(element.tags),
     source: "overpass",
     distanceMeters: Math.round(distanceMeters),
-    etaMinutes: Math.max(1, Math.round(distanceMeters / 80)),
+    distanceType: "straight",
   };
+}
+
+async function fetchNominatimJson(path, cacheKey) {
+  const cacheHit = geocodeCache.get(cacheKey);
+  if (cacheHit && cacheHit.expiresAt > Date.now()) {
+    return cacheHit.data;
+  }
+
+  const response = await fetch(`${NOMINATIM_ENDPOINT}${path}`, {
+    headers: {
+      "User-Agent": "stem-hackathon-spring2026/1.0",
+      Accept: "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Nominatim API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  geocodeCache.set(cacheKey, { data, expiresAt: Date.now() + SEARCH_CACHE_MS });
+  return data;
 }
 
 async function fetchFacilities({ lat, lng, radius, keyword, category }) {
@@ -107,8 +200,7 @@ async function fetchFacilities({ lat, lng, radius, keyword, category }) {
   const facilities = (payload.elements || [])
     .map((element) => normalizeFacility(element, lat, lng))
     .filter(Boolean)
-    .sort((a, b) => a.distanceMeters - b.distanceMeters)
-    .slice(0, 50);
+    .sort((a, b) => a.distanceMeters - b.distanceMeters);
 
   searchCache.set(cacheKey, { data: facilities, expiresAt: Date.now() + SEARCH_CACHE_MS });
   return facilities;
@@ -144,6 +236,67 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+app.get("/api/geocode", async (req, res) => {
+  const query = String(req.query.query || "").trim();
+  if (!query) {
+    return res.status(400).json({ error: "query は必須です。" });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      q: query,
+      format: "jsonv2",
+      limit: "1",
+      addressdetails: "1",
+    });
+    const payload = await fetchNominatimJson(`/search?${params.toString()}`, `g:${query.toLowerCase()}`);
+    const first = payload?.[0];
+
+    if (!first) {
+      return res.status(404).json({ error: "住所から位置を特定できませんでした。" });
+    }
+
+    return res.json({
+      lat: Number(first.lat),
+      lng: Number(first.lon),
+      address: first.display_name || query,
+    });
+  } catch (error) {
+    return res.status(502).json({
+      error: "住所変換APIへの接続に失敗しました。",
+      detail: error instanceof Error ? error.message : "unknown",
+    });
+  }
+});
+
+app.get("/api/reverse-geocode", async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ error: "lat/lng は必須です。" });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      lat: String(lat),
+      lon: String(lng),
+      format: "jsonv2",
+      addressdetails: "1",
+    });
+    const payload = await fetchNominatimJson(`/reverse?${params.toString()}`, `r:${lat.toFixed(6)}:${lng.toFixed(6)}`);
+    return res.json({
+      lat,
+      lng,
+      address: payload?.display_name || "住所情報なし",
+    });
+  } catch (error) {
+    return res.status(502).json({
+      error: "逆ジオコーディングAPIへの接続に失敗しました。",
+      detail: error instanceof Error ? error.message : "unknown",
+    });
+  }
+});
+
 app.get("/api/route", async (req, res) => {
   const fromLat = Number(req.query.fromLat);
   const fromLng = Number(req.query.fromLng);
@@ -157,8 +310,8 @@ app.get("/api/route", async (req, res) => {
   const straightDistance = haversineMeters(fromLat, fromLng, toLat, toLng);
   const fallback = {
     distanceMeters: Math.round(straightDistance),
-    durationMinutes: Math.max(1, Math.round(straightDistance / 80)),
     source: "fallback",
+    distanceType: "straight",
   };
 
   try {
@@ -178,8 +331,8 @@ app.get("/api/route", async (req, res) => {
 
     return res.json({
       distanceMeters: Math.round(route.distance),
-      durationMinutes: Math.max(1, Math.round(route.duration / 60)),
       source: "osrm",
+      distanceType: "route",
     });
   } catch (_error) {
     return res.json(fallback);

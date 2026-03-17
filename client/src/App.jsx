@@ -1,15 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchRoute, searchFacilities } from "./lib/api";
-import { formatDistance, formatDuration } from "./lib/format";
+import { fetchRoute, geocodeAddress, reverseGeocode, searchFacilities } from "./lib/api";
+import { formatDistance } from "./lib/format";
 import { getOrCreateUserId, loadSavedItems, saveSavedItems } from "./lib/storage";
 
 const CATEGORY_OPTIONS = [
   { label: "すべて", value: "all" },
-  { label: "カフェ", value: "cafe" },
+  { label: "ファストフード", value: "fast_food" },
   { label: "レストラン", value: "restaurant" },
   { label: "コンビニ", value: "convenience" },
-  { label: "公園", value: "park" },
-  { label: "観光", value: "attraction" },
+  { label: "ドラッグストア", value: "drugstore" },
 ];
 
 function createSavedItem(userId, facility) {
@@ -27,13 +26,16 @@ function createSavedItem(userId, facility) {
 export default function App() {
   const [userId, setUserId] = useState("");
   const [coords, setCoords] = useState({ lat: "", lng: "" });
+  const [currentAddress, setCurrentAddress] = useState("");
   const [radius, setRadius] = useState(1000);
   const [keyword, setKeyword] = useState("");
   const [category, setCategory] = useState("all");
 
   const [loadingLocation, setLoadingLocation] = useState(false);
+  const [loadingGeocode, setLoadingGeocode] = useState(false);
   const [loadingSearch, setLoadingSearch] = useState(false);
   const [loadingRouteId, setLoadingRouteId] = useState("");
+  const [searchMessage, setSearchMessage] = useState("");
 
   const [error, setError] = useState("");
   const [results, setResults] = useState([]);
@@ -83,31 +85,79 @@ export default function App() {
 
     setLoadingLocation(true);
     navigator.geolocation.getCurrentPosition(
-      (position) => {
+      async (position) => {
+        const lat = position.coords.latitude.toFixed(6);
+        const lng = position.coords.longitude.toFixed(6);
         setCoords({
-          lat: position.coords.latitude.toFixed(6),
-          lng: position.coords.longitude.toFixed(6),
+          lat,
+          lng,
         });
-        setLoadingLocation(false);
+        try {
+          const resolved = await reverseGeocode(lat, lng);
+          setCurrentAddress(resolved.address || "住所情報なし");
+        } catch (_error) {
+          setCurrentAddress("住所の取得に失敗しました（座標は取得済み）");
+        } finally {
+          setLoadingLocation(false);
+        }
       },
       () => {
         setLoadingLocation(false);
-        setError("位置情報を取得できませんでした。手動で緯度・経度を入力してください。");
+        setError("位置情報を取得できませんでした。住所入力で検索してください。");
       },
       { enableHighAccuracy: true, timeout: 10000 }
     );
+  };
+
+  const convertAddressToCoords = async () => {
+    if (!currentAddress.trim()) {
+      setError("住所を入力してください。");
+      return;
+    }
+    setError("");
+    setLoadingGeocode(true);
+    try {
+      const converted = await geocodeAddress(currentAddress.trim());
+      setCoords({
+        lat: Number(converted.lat).toFixed(6),
+        lng: Number(converted.lng).toFixed(6),
+      });
+      setCurrentAddress(converted.address || currentAddress.trim());
+    } catch (geocodeError) {
+      setError(geocodeError instanceof Error ? geocodeError.message : "住所の変換に失敗しました。");
+    } finally {
+      setLoadingGeocode(false);
+    }
   };
 
   const handleSearch = async (event) => {
     event.preventDefault();
     setError("");
     setLoadingSearch(true);
+    setSearchMessage("検索条件を確認しています...");
     setSelectedResultIds([]);
 
     try {
+      let targetLat = coords.lat;
+      let targetLng = coords.lng;
+
+      if ((!targetLat || !targetLng) && currentAddress.trim()) {
+        setSearchMessage("住所を座標に変換しています...");
+        const converted = await geocodeAddress(currentAddress.trim());
+        targetLat = Number(converted.lat).toFixed(6);
+        targetLng = Number(converted.lng).toFixed(6);
+        setCoords({ lat: targetLat, lng: targetLng });
+        setCurrentAddress(converted.address || currentAddress.trim());
+      }
+
+      if (!targetLat || !targetLng) {
+        throw new Error("現在位置または住所を入力してください。");
+      }
+
+      setSearchMessage("施設データを取得しています。10km検索は少し時間がかかる場合があります...");
       const facilities = await searchFacilities({
-        lat: coords.lat,
-        lng: coords.lng,
+        lat: targetLat,
+        lng: targetLng,
         radius,
         keyword,
         category,
@@ -118,6 +168,7 @@ export default function App() {
       setError(searchError instanceof Error ? searchError.message : "検索に失敗しました。");
     } finally {
       setLoadingSearch(false);
+      setSearchMessage("");
     }
   };
 
@@ -212,26 +263,25 @@ export default function App() {
         <section className="panel">
           <h2>1. 現在位置と検索条件</h2>
           <form onSubmit={handleSearch} className="grid-form">
-            <button type="button" onClick={selectCurrentLocation} disabled={loadingLocation}>
-              {loadingLocation ? "位置取得中..." : "現在位置を取得"}
-            </button>
+            <div className="current-location-block">
+              <div className="current-location-buttons">
+                <button type="button" onClick={selectCurrentLocation} disabled={loadingLocation}>
+                  {loadingLocation ? "現在位置と住所を取得中..." : "現在位置を取得"}
+                </button>
+                <button type="button" onClick={convertAddressToCoords} disabled={loadingGeocode}>
+                  {loadingGeocode ? "住所を変換中..." : "住所を座標に変換"}
+                </button>
+              </div>
 
-            <label>
-              緯度
-              <input
-                value={coords.lat}
-                onChange={(e) => setCoords((prev) => ({ ...prev, lat: e.target.value }))}
-                placeholder="35.681236"
-              />
-            </label>
-            <label>
-              経度
-              <input
-                value={coords.lng}
-                onChange={(e) => setCoords((prev) => ({ ...prev, lng: e.target.value }))}
-                placeholder="139.767125"
-              />
-            </label>
+              <label>
+                現在住所（検索基準）
+                <input
+                  value={currentAddress}
+                  onChange={(e) => setCurrentAddress(e.target.value)}
+                  placeholder="現在地を取得、または住所を入力してください"
+                />
+              </label>
+            </div>
 
             <label>
               キーワード
@@ -254,7 +304,7 @@ export default function App() {
               <input
                 type="range"
                 min="100"
-                max="3000"
+                max="10000"
                 step="100"
                 value={radius}
                 onChange={(e) => setRadius(Number(e.target.value))}
@@ -265,6 +315,21 @@ export default function App() {
               {loadingSearch ? "検索中..." : "近隣施設を検索"}
             </button>
           </form>
+
+          {loadingSearch ? (
+            <div className="loading-banner" role="status" aria-live="polite">
+              <span className="spinner" />
+              <div>
+                <p>検索中です。完了までこのままお待ちください。</p>
+                <p className="muted">{searchMessage}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {coords.lat && coords.lng ? (
+            <p className="muted">内部変換座標: {coords.lat}, {coords.lng}</p>
+          ) : null}
+
           {error ? <p className="error-text">{error}</p> : null}
         </section>
 
@@ -295,7 +360,7 @@ export default function App() {
                   <h3>{facility.name}</h3>
                   <p>{facility.address}</p>
                   <p>
-                    距離: {formatDistance(facility.distanceMeters)} / 徒歩目安: {formatDuration(facility.etaMinutes)}
+                    距離: {formatDistance(facility.distanceMeters)}（直線距離）
                   </p>
                   <p>カテゴリ: {facility.category}</p>
                   {facility.phone ? <p>TEL: {facility.phone}</p> : null}
@@ -314,13 +379,13 @@ export default function App() {
                       保存
                     </button>
                     <button type="button" onClick={() => loadRoute(facility)} disabled={loadingRouteId === facility.id}>
-                      {loadingRouteId === facility.id ? "計算中..." : "ルート時間/距離"}
+                      {loadingRouteId === facility.id ? "計算中..." : "経路距離を確認"}
                     </button>
                   </div>
 
                   {route ? (
                     <p className="route-box">
-                      ルート: {formatDistance(route.distanceMeters)} / {formatDuration(route.durationMinutes)} ({route.source})
+                      {route.distanceType === "route" ? "経路距離" : "直線距離"}: {formatDistance(route.distanceMeters)}
                     </p>
                   ) : null}
                 </article>
@@ -377,9 +442,6 @@ export default function App() {
                 </label>
 
                 <p>{item.facility?.address || "住所情報なし"}</p>
-                <p>
-                  座標: {item.facility?.lat}, {item.facility?.lng}
-                </p>
                 <button type="button" onClick={() => deleteSavedItem(item.id)}>
                   削除
                 </button>
