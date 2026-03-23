@@ -254,7 +254,7 @@ export default function App() {
     <div className="page">
       <header className="hero">
         <p className="eyebrow">STEM HACKATHON 2026</p>
-        <h1>寄り道ナビ・プロトタイプ</h1>
+        <h1>寄り道ナビ</h1>
         <p>現在地から近場の施設を探し、保存・整理・ランダム選択まで一気に操作できます。</p>
         <div className="user-chip">userId: {userId || "作成中..."}</div>
       </header>
